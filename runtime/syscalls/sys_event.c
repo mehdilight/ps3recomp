@@ -9,6 +9,58 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#if defined(__APPLE__) || defined(__linux__)
+#include <execinfo.h>             /* backtrace: ps3_dbg_guest_bt */
+#include <dlfcn.h>                /* dlsym: the per-title guest-fn resolver */
+#endif
+
+/* Portable guest-callstack dump.
+ *
+ * The runtime already has ppu_guest_callstack, but its body lives behind
+ * #ifdef _WIN32 (RtlCaptureStackBackTrace + GetModuleHandleA). On macOS _WIN32
+ * is NOT defined, so that one links to the empty stub in host_stubs.c and every
+ * "who is blocked here" diagnostic prints nothing. This one uses backtrace(3)
+ * and the profiler's host->guest resolver, which exist on every platform we
+ * build for. Each lifted func_XXXX is a real host frame, so the resolved chain
+ * names the guest code directly.
+ *
+ * Used by the queue wait and the lightweight-mutex wait to identify a wedged
+ * thread by the guest function it is stuck in (the FMOD init hang: the main
+ * thread waits on an LWM another PPU thread holds, and that thread waits for an
+ * SPU event). */
+void ps3_dbg_guest_bt(const char* tag)
+{
+#if defined(__APPLE__) || defined(__linux__)
+    /* The host->guest resolver is generated per title (it walks the recompiled
+     * function table), so it lives in the GAME executable, not in this library.
+     * Look it up lazily: this library is also linked into small host/test
+     * targets that have no function table at all, and a direct reference would
+     * just fail to link there. Absent resolver = print nothing. */
+    typedef uint32_t (*resolve_fn)(void*);
+    static resolve_fn res; static int tried;
+    if (!tried) {
+        tried = 1;
+        void* sym = dlsym(RTLD_DEFAULT, "ppu_prof_resolve_host");
+        res = (resolve_fn)sym;
+    }
+    if (!res) return;
+    void* bt[40];
+    int n = backtrace(bt, 40);
+    char g[1200]; int gp = 0; uint32_t last = 0;
+    g[0] = 0;
+    for (int i = 0; i < n && gp < 1000; i++) {
+        uint32_t f = res(bt[i]);
+        if (f && f != last) {
+            last = f;
+            gp += snprintf(g + gp, sizeof(g) - gp, " f_%08X", f);
+        }
+    }
+    fprintf(stderr, "[GBT %s] guest:%s\n", tag ? tag : "?", g);
+    fflush(stderr);
+#else
+    (void)tag;
+#endif
+}
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -300,15 +352,38 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
     /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
-     * exact game function the main thread is stuck polling in the flip loop. */
+     * exact game function the main thread is stuck polling in the flip loop.
+     * PS3_WAITBT_AFTER=<seconds> delays the dumps until the title has settled
+     * (the boot itself blocks on these queues constantly, so the first wait is
+     * never the interesting one). */
     if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
         static unsigned char seen[8][8] = {{0}};
+        static int after_s = -2;
+        if (after_s == -2) {
+            const char* a = getenv("PS3_WAITBT_AFTER");
+            after_s = a ? atoi(a) : 0;
+        }
+        int ready = 1;
+        if (after_s > 0) {
+            static double t0 = 0;
+#ifdef _WIN32
+            double now = (double)GetTickCount64() / 1000.0;
+#else
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+            if (t0 == 0) { t0 = now; ready = 0; }
+            else ready = (now - t0) >= (double)after_s;
+        }
         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
-        if (!seen[t][qk]) {
+        if (ready && !seen[t][qk]) {
             seen[t][qk] = 1;
-            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            /* ps3_dbg_guest_bt is the host-backtrace->guest resolver that works
+             * on macOS; ppu_dump_guest_stack is a _WIN32-only body and links to
+             * an empty stub here, so the old call printed nothing. */
+            extern void ps3_dbg_guest_bt(const char*);
             char tag[48]; snprintf(tag, sizeof tag, "waitbt tid=%u q=%u", t, queue_id);
-            ppu_dump_guest_stack(ctx, tag);
+            ps3_dbg_guest_bt(tag);
         }
     }
 
@@ -466,6 +541,21 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (q->count == 0 && timeout_us == 0) {
         extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
         spu_dispatch_frame_by_queue(queue_id, 0);
+    }
+
+    /* About to block with no timeout and nothing queued: print the guest call
+     * chain of the waiter. A thread parked in an infinite receive is the shape
+     * of the FMOD init wedge, and the chain says whether the event it wants can
+     * come from the SPU at all. First few only -- this fires once per wedge. */
+    if (q->count == 0 && timeout_us == 0) {
+        extern void ps3_dbg_guest_bt(const char*);
+        { static int _n = 0;
+          if (_n++ < 6) {
+              char tg[48];
+              snprintf(tg, sizeof tg, "evrecv q=%u tid=%llu", queue_id,
+                       (unsigned long long)ctx->thread_id);
+              ps3_dbg_guest_bt(tg);
+          } }
     }
 
 #ifdef _WIN32
@@ -691,6 +781,92 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
  * EVENT PORTS
  * ========================================================================= */
 
+/* --- SPU-side receive-event bridge (stop code 0x110) -----------------------
+ * An SPU thread asking lv2 for an event (sys_spu_thread_receive_event) blocks
+ * until the guest posts one to a queue bound to that thread
+ * (sys_spu_thread_bind_queue). The SPU host thread parks in
+ * spu_recv_event_service (lv2_register.c); the two helpers below let it poll
+ * one queue and sleep between polls, and let the push path wake it at once. */
+#ifdef _WIN32
+static CRITICAL_SECTION g_spu_recv_lock;
+static CONDITION_VARIABLE g_spu_recv_cv;
+static INIT_ONCE g_spu_recv_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK spu_recv_init_once(PINIT_ONCE o, PVOID p, PVOID* c)
+{ (void)o; (void)p; (void)c; InitializeCriticalSection(&g_spu_recv_lock);
+  InitializeConditionVariable(&g_spu_recv_cv); return TRUE; }
+static void spu_recv_lock_acquire(void)
+{ InitOnceExecuteOnce(&g_spu_recv_once, spu_recv_init_once, NULL, NULL);
+  EnterCriticalSection(&g_spu_recv_lock); }
+static void spu_recv_lock_release(void) { LeaveCriticalSection(&g_spu_recv_lock); }
+#else
+static pthread_mutex_t g_spu_recv_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_spu_recv_cv   = PTHREAD_COND_INITIALIZER;
+static void spu_recv_lock_acquire(void) { pthread_mutex_lock(&g_spu_recv_lock); }
+static void spu_recv_lock_release(void) { pthread_mutex_unlock(&g_spu_recv_lock); }
+#endif
+
+static void spu_recv_wake_all(void)
+{
+    spu_recv_lock_acquire();
+#ifdef _WIN32
+    WakeAllConditionVariable(&g_spu_recv_cv);
+#else
+    pthread_cond_broadcast(&g_spu_recv_cv);
+#endif
+    spu_recv_lock_release();
+}
+
+/* Pop one event from queue `queue_id` without blocking.
+ * Returns 0 when an event was taken, -1 when the queue is empty, -2 when it
+ * does not exist (or was cancelled); the caller decides what the SPU sees. */
+int sys_event_queue_spu_pop(uint32_t queue_id, sys_event_t* out)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -2;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active || q->cancelled) return -2;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+#endif
+    if (q->count <= 0) {
+#ifdef _WIN32
+        LeaveCriticalSection(&q->lock);
+#else
+        pthread_mutex_unlock(&q->lock);
+#endif
+        return -1;
+    }
+    if (out) *out = q->buffer[q->head];
+    q->head = (q->head + 1) % q->capacity;
+    q->count--;
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_unlock(&q->lock);
+#endif
+    return 0;
+}
+
+/* Sleep up to `ms` for any push, then let the caller re-poll its own queue. */
+void sys_event_spu_recv_wait(int ms)
+{
+#ifdef _WIN32
+    spu_recv_lock_acquire();
+    SleepConditionVariableCS(&g_spu_recv_cv, (CRITICAL_SECTION*)&g_spu_recv_lock, (DWORD)ms);
+    spu_recv_lock_release();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    spu_recv_lock_acquire();
+    pthread_cond_timedwait(&g_spu_recv_cv, &g_spu_recv_lock, &ts);
+    spu_recv_lock_release();
+#endif
+}
+
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
@@ -724,6 +900,12 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     pthread_mutex_lock(&q->lock);
 #endif
 
+    { static int _n = 0; if (_n++ < 120)
+        fprintf(stderr, "[push] q=%u src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX\n",
+                (unsigned)((q - g_sys_event_queues) + 1),
+                (unsigned long long)evt->source, (unsigned long long)evt->data1,
+                (unsigned long long)evt->data2, (unsigned long long)evt->data3); }
+
     if (q->count >= q->capacity) {
 #ifdef _WIN32
         LeaveCriticalSection(&q->lock);
@@ -744,6 +926,11 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
 #endif
+
+    /* An SPU thread parked in sys_spu_thread_receive_event (stop 0x110) waits
+     * for exactly this: an event arriving on a queue the guest bound to it.
+     * Wake it after releasing the queue lock so its pop sees the event. */
+    spu_recv_wake_all();
 
     return 0;
 }

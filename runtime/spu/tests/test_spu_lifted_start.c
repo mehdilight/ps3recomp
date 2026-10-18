@@ -983,6 +983,8 @@ uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
 uint32_t spurs_port_queue(uint32_t port)        { (void)port; return 0; }
 void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
 void sys_rsx_init(lv2_syscall_table* t) { (void)t; }
-void spu_raw_note_image(uint32_t ea, uint32_t src) { (void)ea; (void)src; }
+int spu_raw_note_image(uint32_t img_ea, uint32_t src_ea, uint32_t entry)
+{ (void)img_ea; (void)src_ea; (void)entry; return 0; }
+int spu_raw_image_id_for(uint32_t img_ea) { (void)img_ea; return 0; }
 int32_t spu_registry_fallback(uint32_t tid, uint32_t args, uint32_t size, void* user)
 { (void)tid; (void)args; (void)size; (void)user; return -1; }

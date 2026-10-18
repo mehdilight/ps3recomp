@@ -3660,10 +3660,39 @@ int rsx_metal_backend_pump_messages(void)
 #if !TARGET_OS_IPHONE
     if ([NSThread isMainThread])
         return pump_messages_impl();
+    /* Called from the frame-clock thread. AppKit work has to happen on the
+     * main thread, but the guest OWNS the main thread here (ppu_run is the
+     * main thread's body and never returns to a run loop), so the main
+     * dispatch queue is drained only if the guest happens to leave the
+     * recompiled code long enough. A blocking dispatch_sync therefore parks
+     * the frame clock forever -- and with it the 60 Hz vblank/flip ticks, the
+     * FIFO drain and every present, which is exactly the state LoS2 sat in
+     * after its boot: the guest waiting for a vblank edge that never came.
+     *
+     * Hand the request to the main queue and wait a bounded time for it. If
+     * the main thread is busy we skip this beat; at most one request is ever
+     * outstanding, so a title that never drains the main queue simply runs
+     * without AppKit event pumping instead of deadlocking. */
+    static dispatch_semaphore_t s_pump_done;
+    static atomic_int s_pump_busy;
+    if (!s_pump_done) {
+        s_pump_done = dispatch_semaphore_create(0);
+        atomic_init(&s_pump_busy, 0);
+    }
+    if (atomic_exchange(&s_pump_busy, 1)) return 0;   /* one request in flight */
     __block int result = 0;
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    dispatch_async(dispatch_get_main_queue(), ^{
         result = pump_messages_impl();
+        atomic_store(&s_pump_busy, 0);
+        dispatch_semaphore_signal(s_pump_done);
     });
+    if (dispatch_semaphore_wait(s_pump_done,
+            dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC)) != 0) {
+        /* Timed out: leave s_pump_busy set. The queued block still runs the
+         * moment the main thread reaches its run loop, and it clears the flag
+         * then -- so we neither spin nor pile up requests in the meantime. */
+        return 0;
+    }
     return result;
 #else
     return pump_messages_impl();

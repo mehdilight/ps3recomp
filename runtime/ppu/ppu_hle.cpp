@@ -24,6 +24,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
+#if !defined(_WIN32)
+#include <time.h>         /* clock_gettime: HLE_BT_AFTER */
+#endif
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
  * NID which is globally unique). Sized for the firmware import surface. */
@@ -194,7 +197,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           static unsigned n[8] = {0};
           unsigned t = (unsigned)ctx->thread_id & 7;
           if ((n[t]++ % (unsigned)every) == 0) {
-              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              extern void ps3_dbg_guest_bt(const char*);
               char tag[64];
               /* Print the REAL thread id, not the ring index: tid&7 collides
                * (1, 9 and 17 all land on slot 1) and a stack from a CRI worker
@@ -202,9 +205,49 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                * cost a round. */
               snprintf(tag, sizeof tag, "hle#%u tid=%llu nid=0x%08X", n[t] - 1u,
                        (unsigned long long)ctx->thread_id, nid);
-              ppu_dump_guest_stack(ctx, tag);
-              { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
-                ppu_dump_bctrl_ring((uint32_t)ctx->thread_id, tag); }
+              ps3_dbg_guest_bt(tag);
+          }
+      } }
+    /* HLE_BT_AFTER=<seconds>: one guest-stack dump per thread, taken from the
+     * first HLE call that thread makes once the title has settled. "The title
+     * booted and then went quiet" needs a stack from every thread at once, not
+     * a stream of samples: each thread's chain names the exact wait it is
+     * parked in. (ppu_dump_guest_stack is a _WIN32-only body and links empty on
+     * macOS, so the dump goes through the host->guest resolver instead.) */
+    { static int after = -2;
+      if (after == -2) { const char* a = getenv("HLE_BT_AFTER"); after = a ? atoi(a) : -1; }
+      if (after >= 0 && ctx) {
+          static double t0 = 0;
+          static unsigned char done[PS3_HLE_INFLIGHT_MAX];
+          unsigned t = (unsigned)ctx->thread_id;
+#ifdef _WIN32
+          double now = (double)GetTickCount64() / 1000.0;
+#else
+          struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+          double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+          if (t0 == 0) t0 = now;
+          if ((now - t0) >= (double)after && t < PS3_HLE_INFLIGHT_MAX && !done[t]) {
+              done[t] = 1;
+              /* g_hle_inflight[] names the HLE function every guest thread is
+               * INSIDE right now. A thread parked in an HLE wait never
+               * re-enters ps3_hle_call, so it never produces a stack dump of
+               * its own -- this array is the only way to see it. */
+              { static int dumped_all = 0;
+                if (!dumped_all) {
+                    dumped_all = 1;
+                    fprintf(stderr, "[HLEINFLIGHT] threads inside an HLE:\n");
+                    for (unsigned i = 0; i < PS3_HLE_INFLIGHT_MAX; i++)
+                        if (g_hle_inflight[i])
+                            fprintf(stderr, "[HLEINFLIGHT]   guest-tid %-3u in %s\n",
+                                    i, g_hle_inflight[i]);
+                    fflush(stderr);
+                } }
+              extern void ps3_dbg_guest_bt(const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "hle-after tid=%llu nid=0x%08X",
+                       (unsigned long long)ctx->thread_id, nid);
+              ps3_dbg_guest_bt(tag);
           }
       } }
 

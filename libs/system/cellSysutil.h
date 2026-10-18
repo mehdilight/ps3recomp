@@ -133,6 +133,7 @@ s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize);
 s32 cellSysutilEnableBgmPlayback(void);
 s32 cellSysutilDisableBgmPlayback(void);
 s32 cellSysutilGetBgmPlaybackStatus(s32* status);
+s32 cellSysutilGetBgmPlaybackStatus2(void* status2);
 s32 cellSysutilSetBgmPlaybackExtraParam(void* param);
 s32 cellSysutilEnableBgmPlaybackEx(s32 param);
 s32 cellSysutilDisableBgmPlaybackEx(void);

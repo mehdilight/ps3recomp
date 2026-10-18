@@ -25,7 +25,10 @@
 #include "sys_fs.h"
 extern void sys_rsx_init(lv2_syscall_table* tbl);   /* libs/video/sys_rsx.c */
 extern void sys_raw_spu_init(lv2_syscall_table* tbl);   /* runtime/spu/spu_raw.c */
-extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
+/* Returns the image id the workload registry matched for the imported ELF, and
+ * records the img_ea -> image id binding a later sys_spu_thread_initialize uses. */
+extern int  spu_raw_note_image(uint32_t img_ea, uint32_t src_ea, uint32_t entry);
+extern int  spu_raw_image_id_for(uint32_t img_ea);
 
 /* Guest scratch for an SPU ELF staged by sys_spu_image_open, which reads the
  * file in and then re-enters the import path with it. Shares the 16 MB region
@@ -295,6 +298,11 @@ typedef struct {
      * it lazily hands every thread the last thread's values. */
     uint64_t args[4];
     uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
+    /* Image id the workload registry resolved for this thread's sys_spu_image at
+     * _sys_spu_image_import (0 = unknown). Passed to spu_lifted_thread_setup so
+     * dispatch starts in the RIGHT image: several registered images link at the
+     * same LS addresses, so the entry point alone cannot identify one. */
+    int      img_id;
     /* Real SPU execution: the architectural context a thread running its own
      * lifted image owns, allocated at group_start and holding that thread's
      * local store. NULL for fallback and interpreter threads. */
@@ -336,6 +344,14 @@ typedef struct {
      * waiting on the command queue never woke. */
     struct { uint32_t spup; uint32_t queue; } evt_bind[8];
     int                 evt_bind_n;
+
+    /* sys_spu_thread_bind_queue(id, spuq, spuq_num): the INBOUND direction.
+     * The SPU asks for an event (stop 0x110) naming `spuq_num` -- an arbitrary
+     * guest key, e.g. 0x63 for the FMOD mixer -- and lv2 must find the event
+     * queue that was bound under that name. RPCS3 models this as the spu
+     * thread's spuq array (SPUThread.cpp stop_and_signal, get_queue). */
+    struct { uint32_t spuq_num; uint32_t queue; } spuq_bind[4];
+    int                 spuq_bind_n;
 } spu_thread_t;
 
 typedef struct {
@@ -610,6 +626,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
     t->img_ea    = img_ea;
+    t->img_id    = img_ea ? spu_raw_image_id_for(img_ea) : 0;
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
     /* lv2 copy semantics: take the four u64s now (see spu_thread_t.args). */
@@ -1012,6 +1029,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.group_id = id;
                 d.entry    = t->entry_point;
                 d.img_ea   = t->img_ea;
+                d.img_id   = t->img_id;
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
                 t->running = 1;
@@ -1639,16 +1657,38 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         if (!spu->spu_group_id) {
             queue = spurs_port_queue(port);
         } else {
-            AcquireSRWLockShared(&s_spu_port_lock);
-            spu_group_t* group = spu_find_group(spu->spu_group_id);
-            if (group) queue = group->user_event_ports[port];
-            ReleaseSRWLockShared(&s_spu_port_lock);
+            /* The PER-THREAD connect_event binding is the route
+             * sys_spu_thread_send_event takes: RPCS3 SPUThread.cpp:6096 sends
+             * through `this->spup[spup]`, the array filled by
+             * sys_spu_thread_connect_event(id, eq, et, spup) -- exactly what our
+             * evt_bind[] records. Resolve it first.
+             *
+             * Only looking at the GROUP port table here (as this used to) drops
+             * the FMOD mixer's reply: the game binds that thread with
+             * connect_event(el->queue 1, et=1, spup=9) and never touches a group
+             * port, so queue came back 0, the SPU was told CELL_ENOTCONN, and the
+             * PPU thread waiting on queue 1 (func_008181D8: port_send kick, then
+             * an infinite receive) waited forever -- the wedge. */
+            spu_thread_t* t = spu_find_thread(spu->spu_id);
+            if (t) {
+                for (int i = 0; i < t->evt_bind_n; i++)
+                    if (t->evt_bind[i].spup == port) { queue = t->evt_bind[i].queue; break; }
+            }
+            if (!queue) {
+                AcquireSRWLockShared(&s_spu_port_lock);
+                spu_group_t* group = spu_find_group(spu->spu_group_id);
+                if (group) queue = group->user_event_ports[port];
+                ReleaseSRWLockShared(&s_spu_port_lock);
+            }
         }
         result = CELL_ENOTCONN;
         if (queue) {
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+            { static int _n = 0; if (_n++ < 24)
+                fprintf(stderr, "[spu-evt] send_event spu=0x%X port=%u d0=0x%X d1=0x%X -> q=%u rc=%d\n",
+                        spu->spu_id, port, value & 0xFFFFFFu, data, queue, result); }
         }
     }
     if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
@@ -1692,6 +1732,128 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
+}
+
+/* sys_spu_thread_bind_queue(spu_thread_id, spuq, spuq_num) -- the INBOUND
+ * direction of the SPU event system (RPCS3 lv2/sys_spu.cpp:2200).
+ *
+ * An SPU asks lv2 for an event by writing `spuq_num` -- an arbitrary guest key,
+ * e.g. 0x63 for the FMOD mixer -- to its out-mailbox and executing stop 0x110
+ * (sys_spu_thread_receive_event). lv2 has to map that key back to a real event
+ * queue; bind_queue is what establishes the mapping.
+ *
+ * Registered to the generic no-op stub until now, so the mapping was lost and
+ * the FMOD SPU's receive could never resolve: the helper unwound into the drain
+ * loop and re-entered it forever (a silent hot spin that also flooded stderr). */
+static int64_t sys_spu_thread_bind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid     = (uint32_t)ctx->gpr[3];
+    uint32_t spuq    = (uint32_t)ctx->gpr[4];   /* event queue id              */
+    uint32_t spuqnum = (uint32_t)ctx->gpr[5];   /* key the SPU will name       */
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        fprintf(stderr, "[SPU] thread_bind_queue tid=0x%X: thread not found\n", tid);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    int slot = -1;
+    for (int i = 0; i < t->spuq_bind_n; i++)
+        if (t->spuq_bind[i].spuq_num == spuqnum) { slot = i; break; }
+    if (slot < 0 && t->spuq_bind_n < 4) slot = t->spuq_bind_n++;
+    if (slot >= 0) { t->spuq_bind[slot].spuq_num = spuqnum; t->spuq_bind[slot].queue = spuq; }
+    fprintf(stderr, "[SPU] thread_bind_queue tid=0x%X queue=%u spuq_num=0x%X%s\n",
+            tid, spuq, spuqnum, (slot >= 0) ? "" : " (table full)");
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+static int64_t sys_spu_thread_unbind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid     = (uint32_t)ctx->gpr[3];
+    uint32_t spuqnum = (uint32_t)ctx->gpr[4];
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH; return (int64_t)(int32_t)CELL_ESRCH; }
+    for (int i = 0; i < t->spuq_bind_n; i++) {
+        if (t->spuq_bind[i].spuq_num != spuqnum) continue;
+        for (int j = i + 1; j < t->spuq_bind_n; j++) t->spuq_bind[j - 1] = t->spuq_bind[j];
+        t->spuq_bind_n--;
+        break;
+    }
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* Service an SPU thread's stop 0x110 (sys_spu_thread_receive_event).
+ *
+ * Called from spu_stop for a context that runs its own sys_spu image (see
+ * recv_evt_enabled). Consumes the queue key the SPU put in its out-mailbox and
+ * BLOCKS until the game posts an event to the queue bound under that key --
+ * which is what hardware does; RPCS3 models the same wait with lv2_obj::sleep.
+ * On success the reply {CELL_OK, data1, data2, data3} is staged in rcv_evt (the
+ * SPU reads the four words back with four rdch SPU_RdInMbox) and the caller
+ * resumes the SPU inline at the instruction after the stop.
+ *
+ * Returns 1 when the stop was serviced (the caller must set the SPU RUNNING),
+ * 0 when it was not (no binding at all -- fall back to the old behaviour so an
+ * unexpected stop cannot introduce a new hang). */
+int spu_recv_event_service(spu_context* ctx)
+{
+    extern int  sys_event_queue_spu_pop(uint32_t, sys_event_t*);
+    extern void sys_event_spu_recv_wait(int);
+
+    if (!ctx) return 0;
+
+    uint32_t spuqnum = ctx->ch_out_mbox.value;
+    if (ctx->ch_out_mbox.count) ctx->ch_out_mbox.count = 0;
+
+    spu_thread_t* t = spu_find_thread(ctx->spu_id);
+    uint32_t q = 0;
+    if (t) {
+        for (int i = 0; i < t->spuq_bind_n; i++)
+            if (t->spuq_bind[i].spuq_num == spuqnum) { q = t->spuq_bind[i].queue; break; }
+    }
+    if (!q) {
+        static int _n = 0;
+        if (_n++ < 16)
+            fprintf(stderr, "[spu-recv] stop 0x110 spu=0x%X spuq_num=0x%X: no bound "
+                            "queue (thread %s) -- leaving the stop unserviced\n",
+                    ctx->spu_id, spuqnum, t ? "found" : "MISSING");
+        return 0;
+    }
+
+    fprintf(stderr, "[spu-recv] spu=0x%X waiting for an event on queue %u "
+                    "(spuq_num=0x%X)\n", ctx->spu_id, q, spuqnum);
+    fflush(stderr);
+
+    for (;;) {
+        sys_event_t ev;
+        int rc = sys_event_queue_spu_pop(q, &ev);
+        if (rc == 0) {
+            ctx->rcv_evt[0] = 0;                 /* CELL_OK */
+            ctx->rcv_evt[1] = (uint32_t)ev.data1;
+            ctx->rcv_evt[2] = (uint32_t)ev.data2;
+            ctx->rcv_evt[3] = (uint32_t)ev.data3;
+            ctx->rcv_evt_n   = 4;
+            ctx->rcv_evt_i   = 0;
+            fprintf(stderr, "[spu-recv] spu=0x%X got event src=0x%llX d1=0x%08X d2=0x%08X "
+                            "d3=0x%08X -- resuming\n", ctx->spu_id,
+                    (unsigned long long)ev.source,
+                    (uint32_t)ev.data1, (uint32_t)ev.data2, (uint32_t)ev.data3);
+            fflush(stderr);
+            return 1;
+        }
+        if (rc == -2) {   /* queue gone: hand the SPU EINVAL, as RPCS3 does */
+            ctx->rcv_evt[0] = 0x80010002u;        /* CELL_EINVAL */
+            ctx->rcv_evt_n  = 1;
+            ctx->rcv_evt_i  = 0;
+            fprintf(stderr, "[spu-recv] spu=0x%X queue %u is gone -> CELL_EINVAL\n",
+                    ctx->spu_id, q);
+            fflush(stderr);
+            return 1;
+        }
+        sys_event_spu_recv_wait(50);
+    }
 }
 
 /* SPU -> PPU outbound mailbox delivery. Installed into spu_channels.c's
@@ -1960,7 +2122,7 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
      * last chance to identify the image by content. Fingerprint it here and the
      * raw-SPU layer resolves the lifted entry from the same workload registry
      * SPURS jobs use (runtime/spu/spu_raw.c). No-op for a SPU-thread image. */
-    spu_raw_note_image(src_ea, entry);
+    spu_raw_note_image(img_ea, src_ea, entry);
     uint32_t phoff   = vm_read_be32(src_ea + 0x1C);
     uint16_t phentsz = vm_read_be16(src_ea + 0x2A);
     uint16_t phnum   = vm_read_be16(src_ea + 0x2C);
@@ -2526,8 +2688,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,    sys_spu_thread_set_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,    sys_spu_thread_get_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_bind_queue_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_unbind_queue_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
 

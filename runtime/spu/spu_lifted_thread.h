@@ -33,6 +33,11 @@ typedef struct spu_lifted_thread_desc {
     uint32_t group_id;   /* parent thread group                               */
     uint32_t entry;      /* LS entry point, read from the sys_spu_image       */
     uint32_t img_ea;     /* guest sys_spu_image; 0 deploys nothing            */
+    /* Image id the workload registry resolved for that sys_spu_image at import
+     * time, or 0 when it did not match a lifted image. Preferred over inferring
+     * the image from `entry`: SPU ELFs all link at va 0x80, so entries collide
+     * across images and the LS address is ambiguous. */
+    int      img_id;
     uint64_t args[4];    /* sys_spu_thread_argument, as captured at initialize */
 } spu_lifted_thread_desc;
 

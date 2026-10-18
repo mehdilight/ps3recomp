@@ -246,6 +246,16 @@ typedef struct spu_context {
     uint32_t rcv_evt[4];
     int      rcv_evt_n;             /* remaining unread reply words */
     int      rcv_evt_i;
+    /* SYS_SPU_THREAD_STOP_RECEIVE_EVENT (stop code 0x110) is serviced for this
+     * context: it means the SPU is asking lv2 to hand it an event from a queue
+     * the guest bound to this thread (sys_spu_thread_bind_queue). Set only for
+     * threads running their OWN lifted sys_spu image (spu_lifted_thread_setup);
+     * a SPURS task/policy does its stop-and-signal for other reasons and must
+     * keep the yield semantics. When set, spu_stop parks the host thread until
+     * an event is available, fills rcv_evt with {CELL_OK,data1,data2,data3} and
+     * resumes the SPU inline -- without this the FMOD mixer's mailbox helper
+     * unwound into the drain loop and spun forever. */
+    int      recv_evt_enabled;
     spu_channel ch_out_intr_mbox;   /* SPU -> PPU interrupt mailbox */
     spu_channel ch_sig_notify[2];   /* Signal notification 1 & 2 */
 

@@ -195,35 +195,84 @@ static spu_lifted_entry_fn s_pending_entry;
 static int                 s_pending_image_id;
 static uint32_t            s_pending_elf_entry;
 
-void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
+/* img_ea -> image id. A SPU THREAD (sys_spu_thread_initialize -> group_start) is
+ * not a raw SPU: lv2 starts it through spu_lifted_thread_setup, which used to
+ * infer the image from the thread's LS entry point. That inference is wrong
+ * whenever two registered images share an LS address, which is the normal case
+ * -- every SPU ELF links at va 0x80, so entry points collide across images and
+ * the lookup hands back whichever registered first. Castlevania: LoS2's Bink
+ * decoder (entry 0xD0) came up as the FMOD mixer (image 1) exactly that way and
+ * the group faulted on its first instruction.
+ *
+ * The image the thread is actually made of is known precisely at import time,
+ * from the fingerprint of the ELF the guest handed over. Remember it against
+ * the sys_spu_image the guest then passes to sys_spu_thread_initialize. */
+#define SPU_IMG_BIND_MAX 64
+static struct { uint32_t img_ea; int image_id; } s_img_bind[SPU_IMG_BIND_MAX];
+
+int spu_raw_image_id_for(uint32_t img_ea)
 {
-    if (!vm_base) return;
+    if (!img_ea) return 0;
+    for (int i = 0; i < SPU_IMG_BIND_MAX; i++)
+        if (s_img_bind[i].img_ea == img_ea) return s_img_bind[i].image_id;
+    return 0;
+}
+
+static void img_bind(uint32_t img_ea, int image_id)
+{
+    if (!img_ea || image_id <= 0) return;
+    int slot = -1;
+    for (int i = 0; i < SPU_IMG_BIND_MAX; i++)
+        if (s_img_bind[i].img_ea == img_ea) { slot = i; break; }
+    if (slot < 0) {
+        static int next = 0;
+        slot = next++ % SPU_IMG_BIND_MAX;
+    }
+    s_img_bind[slot].img_ea = img_ea;
+    s_img_bind[slot].image_id = image_id;
+}
+
+int spu_raw_note_image(uint32_t img_ea, uint32_t src_ea, uint32_t entry)
+{
+    if (!vm_base) return 0;
     const uint8_t* e = vm_base + src_ea;
     uint32_t shoff = ((uint32_t)e[0x20] << 24) | ((uint32_t)e[0x21] << 16) |
                      ((uint32_t)e[0x22] << 8)  |  (uint32_t)e[0x23];
     uint32_t shentsz = ((uint32_t)e[0x2E] << 8) | e[0x2F];
     uint32_t shnum   = ((uint32_t)e[0x30] << 8) | e[0x31];
     uint32_t len = shoff + shentsz * shnum;
-    if (!len || len > 0x100000u) return;          /* not a plausible SPU ELF */
+    if (!len || len > 0x100000u) return 0;        /* not a plausible SPU ELF */
 
-    /* SPU_RAW_DUMP=<path>: write the image exactly as the guest presents it, so a
-     * fingerprint that does not match the registered one can be diffed against the
-     * file the offline extractor produced. */
-    { const char* dp = getenv("SPU_RAW_DUMP");
-      if (dp) { FILE* f = fopen(dp, "wb"); if (f) { fwrite(e, 1, len, f); fclose(f);
-                fprintf(stderr, "[spu-raw] dumped %u bytes to %s%c", len, dp, 10); } } }
     uint64_t fp = spu_workload_fingerprint(e, len);
     int image_id = 0;
     spu_lifted_entry_fn fn = spu_workload_find_img(fp, &image_id);
+    /* SPU_RAW_DUMP=<dir or path-prefix>: write every image the guest hands over
+     * that we have NO lifted code for, one file per fingerprint
+     * (<prefix>/<fingerprint>.elf). A title that quietly stalls usually turns
+     * out to be waiting on exactly one such SPU program, and the offline
+     * extractor cannot find it if it lives inside a title data file (LoS2's
+     * music codec is inside Music.packed) -- capturing it at import time is the
+     * only way to get the bytes. */
+    { const char* dp = getenv("SPU_RAW_DUMP");
+      if (dp && !fn) {
+          char path[1024];
+          snprintf(path, sizeof path, "%s/%016llX.elf", dp,
+                   (unsigned long long)fp);
+          FILE* f = fopen(path, "wb");
+          if (f) { fwrite(e, 1, len, f); fclose(f);
+                   fprintf(stderr, "[spu-raw] dumped unlifted image %u bytes -> %s\n",
+                           len, path); } } }
     s_pending_entry     = fn;
     s_pending_image_id  = image_id;
     s_pending_elf_entry = entry;
+    img_bind(img_ea, fn ? image_id : 0);
 
     fprintf(stderr, "[spu-raw] image_import src=0x%08X len=%u entry=0x%05X "
                     "fp=0x%016llX -> %s\n",
             src_ea, len, entry, (unsigned long long)fp,
             fn ? "lifted entry registered" : "NO LIFTED IMAGE (SPU will not run)");
     fflush(stderr);
+    return fn ? image_id : 0;
 }
 
 /* ---------------------------------------------------------------------------

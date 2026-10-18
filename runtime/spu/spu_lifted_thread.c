@@ -77,6 +77,10 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
     ctx->spu_id       = d->tid;
     ctx->spu_group_id = d->group_id;
     ctx->pc           = d->entry & SPU_LS_MASK;
+    /* This is a raw sys_spu_thread running its own image, so stop 0x110 is the
+     * sys_spu_thread_receive_event RPC and must be serviced (see the field's
+     * comment in spu_context.h). */
+    ctx->recv_evt_enabled = 1;
 
     /* Start the thread in the image its entry point belongs to, rather than in
      * image 0. Zero is the registry's wildcard, so a context that keeps it will
@@ -86,7 +90,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = (d->img_id > 0) ? d->img_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);

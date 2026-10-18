@@ -116,6 +116,13 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
  * case the header is corrupt; returns 0 if `image` is not a valid SPU ELF. */
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail);
 
+/* _cellSpursLFQueuePushBody: push `data_ea` (size bytes) into the SPURS LFQueue
+ * instance at `queue_ea` (guest layout written by _cellSpursLFQueueInitialize,
+ * see libs/spurs/cellSpurs.c) and wake parked tasks waiting on it.
+ * `isBlocking` matches the real signature's blocking flag. */
+int spu_spurs_lfqueue_push_body(uint32_t queue_ea, uint32_t data_ea,
+                                uint32_t isBlocking);
+
 /* Dispatch a registered SPU image: fingerprint `image`, find its lifted entry,
  * load it into a fresh local store, and run it with `args_ea` in r3 (SPURS task
  * ABI). Returns 1 if an image matched and ran, 0 if no lifted entry is

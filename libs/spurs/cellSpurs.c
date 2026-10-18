@@ -555,6 +555,29 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
+/* cellSpursInitializeWithAttribute2 (NID 0x30AA96C4) -- the SPURS2 ("second
+ * version") bring-up. RPCS3 routes it through the very same _spurs::initialize()
+ * as the first-version entry point and differs only in ORing SAF_SECOND_VERSION
+ * into the attribute flags, which selects the second-generation SPURS kernel
+ * image for the SPU group and lets nSpus cover the SPURS2 range. Our bring-up is
+ * host-side (spurs_initialize_common starts the scheduler thread and lays the
+ * instance out in guest memory), so the guest-visible layout and the scheduler
+ * are identical for both revisions -- forward there. Castlevania: LoS2 imports
+ * this (and the Taskset2 family below) when it starts its SECOND SPURS instance
+ * with nSpus=2; leaving it unresolved made the init fail and the game pop a
+ * cellMsgDialog error during the disc load. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr)
+{
+    if (!spurs || !attr)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    attr = GUEST_PTR(attr, const CellSpursAttribute*);
+    printf("[cellSpurs] InitializeWithAttribute2(nSpus=%u)\n",
+           (unsigned)attr->nSpus);
+    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
+}
+
 static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
 
 s32 cellSpursFinalize(CellSpurs* spurs)
@@ -901,6 +924,63 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
 }
 
+/* ---- CellSpursTasksetAttribute2 (512-byte guest layout, cellSpurs.h::1176) --
+ * Only the head is read on the create path: name@0x04, args@0x08,
+ * priority[8]@0x10, max_contention@0x18, enable_clear_ls@0x1C,
+ * task_name_buffer@0x20. The 0x200-byte tail is reserved. */
+#define CSTSA2_REVISION        0x00
+#define CSTSA2_ARGS            0x08
+#define CSTSA2_PRIORITY        0x10
+#define CSTSA2_MAX_CONTENTION  0x18
+#define CSTSA2_SIZE            0x200
+
+/* _cellSpursTasksetAttribute2Initialize (NID 0xC2ACDF43): the revision-2
+ * taskset attribute initializer, called as (attr, revision) -- TWO arguments,
+ * unlike the six-argument first-version form. RPCS3 zeroes the 512-byte struct
+ * and seeds every priority with 1, contention 8, clear_ls off, task name buffer
+ * null; that is exactly what the SDK's inline wrapper expects back. */
+s32 _cellSpursTasksetAttribute2Initialize(void* attribute, u32 revision)
+{
+    u32 ea = (u32)(uintptr_t)attribute;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!spurs_guest_range_valid(ea, CSTSA2_SIZE)) return (s32)0x8041090Du;
+
+    /* BE struct in guest memory: write byte-swapped, never a host memset of the
+     * head fields (a raw memset of the whole block is fine -- zero is zero in
+     * any endianness -- then the non-zero defaults go through vm_write32). */
+    memset(vm_base + ea, 0, CSTSA2_SIZE);
+    vm_write32(ea + CSTSA2_REVISION, revision);
+    for (int i = 0; i < 8; i++) *(vm_base + ea + CSTSA2_PRIORITY + i) = 1;
+    vm_write32(ea + CSTSA2_MAX_CONTENTION, 8);
+    printf("[cellSpurs] _TasksetAttribute2Initialize(rev=%u)\n", revision);
+    return CELL_OK;
+}
+
+/* cellSpursCreateTaskset2 (NID 0x4A6465E3): the revision-2 taskset creator.
+ * Same three arguments as CreateTasksetWithAttribute, but the attribute is a
+ * CellSpursTasksetAttribute2 and the taskset is always sizeof(CellSpursTaskset2)
+ * = 0x2900 bytes (RPCS3 passes that size unconditionally; the 0x1900-byte v1
+ * header is layout-compatible up to the TaskInfo array, which is where our
+ * spurs_taskset_init writes). The args/priority/contention the attribute
+ * carries are not consumed by our host scheduler, but they are read so a bad
+ * attribute pointer is caught the same way the firmware would. */
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
+                            const void* attr)
+{
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (taskset && attr_ea) {
+        if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+        if (spurs_guest_range_valid(attr_ea, CSTSA2_SIZE)) {
+            u64  args = vm_read64(attr_ea + CSTSA2_ARGS);
+            u32  mc   = vm_read32(attr_ea + CSTSA2_MAX_CONTENTION);
+            printf("[cellSpurs] CreateTaskset2(attr=0x%08X args=0x%08llX contention=%u)\n",
+                   attr_ea, (unsigned long long)args, mc);
+        }
+    }
+    return spurs_create_taskset(spurs, taskset, 0, NULL, 0, 0x2900u);
+}
+
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
 {
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
@@ -1131,6 +1211,72 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
+/* ---- CellSpursTaskAttribute2 (256-byte guest layout) ---------------------
+ * CellSpursTaskAttribute2 { revision@0x00, sizeContext@0x04, eaContext@0x08
+ * (u64), lsPattern@0x10 (16 B), name@0x20 (guest EA) } -- the revision-2 task
+ * attribute. RPCS3's cellSpurs.h prints the same field order at the same
+ * offsets, and its _cellSpursTaskAttribute2Initialize is implemented (not a
+ * todo), so the zero/revision contract below is read off the oracle. */
+#define CSTA2_REVISION     0x00
+#define CSTA2_SIZE_CONTEXT 0x04
+#define CSTA2_EA_CONTEXT   0x08
+#define CSTA2_LS_PATTERN   0x10
+#define CSTA2_NAME         0x20
+#define CSTA2_SIZE         0x100
+
+/* _cellSpursTaskAttribute2Initialize (NID 0x8ADADF65): called as
+ * (attr, revision) -- TWO arguments, unlike the eight-argument first-version
+ * form. The title hits this one immediately before its first
+ * cellSpursCreateTask2, so it has to leave a usable attribute behind. */
+s32 _cellSpursTaskAttribute2Initialize(void* attribute, u32 revision)
+{
+    u32 ea = (u32)(uintptr_t)attribute;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!spurs_guest_range_valid(ea, CSTA2_SIZE)) return (s32)0x8041090Du;
+
+    memset(vm_base + ea, 0, CSTA2_SIZE);            /* zero is zero either endianness */
+    vm_write32(ea + CSTA2_REVISION, revision);
+    return CELL_OK;
+}
+
+/* cellSpursCreateTask2 (NID 0xE14CA62D): the revision-2 task creator.
+ * ABI read off the title's own dispatcher setup (func_00A52954):
+ *   r3 taskset, r4 &taskId, r5 task ELF EA, r6 &CellSpursTaskArgument (16 B),
+ *   r7 &CellSpursTaskAttribute2 (256 B).
+ * The revision-2 API carries context/sizeContext/lsPattern in the attribute
+ * instead of in separate arguments, so lift those fields out and hand the
+ * whole thing to the first-version core: the taskset layouts agree up to the
+ * TaskInfo array, spurs_taskset_add_task() does the big-endian writes, and the
+ * async dispatch is the same lifted-image registry lookup. LoS2 creates its
+ * PhysX SPU job runners here; with this unimplemented the SPU task never
+ * exists, the task's ELF image is never dispatched, and the PPU dispatcher
+ * waits forever for results that no one can produce. */
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                         void* elf, void* argument, const void* attr)
+{
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    u32 ctx_ea = 0, size_ctx = 0, lsp_ea = 0;
+
+    if (attr_ea) {
+        if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+        if (!spurs_guest_range_valid(attr_ea, CSTA2_SIZE)) return (s32)0x8041090Du;
+        size_ctx = vm_read32(attr_ea + CSTA2_SIZE_CONTEXT);
+        ctx_ea   = (u32)vm_read64(attr_ea + CSTA2_EA_CONTEXT);
+        lsp_ea   = attr_ea + CSTA2_LS_PATTERN;
+    }
+
+    printf("[cellSpurs] CreateTask2(taskset=0x%08X &taskId=0x%08X elf=0x%08X arg=0x%08X"
+           " ctx=0x%08X szctx=%u lsp=0x%08X)\n",
+           (u32)(uintptr_t)taskset, (u32)(uintptr_t)taskId, (u32)(uintptr_t)elf,
+           (u32)(uintptr_t)argument, ctx_ea, size_ctx, lsp_ea);
+
+    /* context goes through as a pointer-shaped EA (the core casts it straight
+     * back to a u32); lsPattern/argument are guest EAs of 16-byte blocks. */
+    return cellSpursCreateTask(taskset, taskId, elf, (void*)(uintptr_t)ctx_ea,
+                               size_ctx, lsp_ea, (u32)(uintptr_t)argument);
+}
+
 /* The SDK's versioned task-attribute initializer. ABI (8 GPR args):
  *   r3=attr r4=revision r5=sdkVersion r6=eaElf r7=eaContext r8=sizeContext
  *   r9=lsPattern r10=argument
@@ -1282,6 +1428,118 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
     }
 
     return CELL_SPURS_TASK_ERROR_SRCH;
+}
+
+/* cellSpursTasksetGetSpursAddress (NID 0x58D58FCF) -- the SPURS2 taskset
+ * accessor that hands back the owning CellSpurs EA. PhysX 3.2's PS3 support
+ * (Source/LowLevel/ps3/src/PS3Support.cpp) calls it to register the taskset
+ * with its SPU dispatcher and then dereferences whatever it found, so leaving
+ * the out pointer at 0 sends it down a degraded path that reads NULL. The EA
+ * is the one spurs_taskset_init recorded at CSTS_SPURS when CreateTaskset2
+ * built the BE layout. */
+s32 cellSpursTasksetGetSpursAddress(CellSpursTaskset* taskset, u32* spurs)
+{
+    u32 taskset_ea = (u32)(uintptr_t)taskset;
+    u32 spurs_out  = (u32)(uintptr_t)spurs;
+
+    if (!taskset_ea || !spurs_out) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskset_ea & 0x7Fu)        return CELL_SPURS_TASK_ERROR_ALIGN;
+
+    u32 spurs_ea = (u32)vm_read64(taskset_ea + CSTS_SPURS);
+    vm_write32(spurs_out, spurs_ea);
+    { static int _n = 0; if (_n++ < 8)
+        printf("[cellSpurs] TasksetGetSpursAddress(taskset=0x%08X) -> spurs=0x%08X\n",
+               taskset_ea, spurs_ea); }
+    return CELL_OK;
+}
+
+/* cellSpursJoinTask2 (NID 0xA7A94892): the SPURS2 spelling of cellSpursJoinTask.
+ * PhysX's pxtask::SpursDispatcher worker pump calls it right after it pops a
+ * work item. RPCS3 answers CELL_OK without touching the exit code, and this
+ * build never dispatches the PhysX SPU tasks the join would wait on, so the
+ * v1 task table has no entry to find -- mirror RPCS3 rather than fail with
+ * CELL_SPURS_TASK_ERROR_SRCH, which the pump treats as a hard error. */
+s32 cellSpursJoinTask2(CellSpursTaskset* taskset, CellSpursTaskId taskId,
+                       s32* exitCode)
+{
+    (void)exitCode;
+    /* Rate-limited: PhysX's dispatcher pump calls this on every lap of a
+     * hot spin loop, and the text alone is enough to fill a 100 MB log. */
+    { static int _n = 0; if (_n++ < 8)
+        printf("[cellSpurs] JoinTask2(taskset=0x%08X id=%u)\n",
+               (u32)(uintptr_t)taskset, taskId); }
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueuePopBody (NID 0x35DAE22B) -- the consumer half of the SPURS
+ * kernel's lock-free queue protocol, the mirror of _cellSpursLFQueuePushBody
+ * (runtime/spu/spu_workload.c implements the SPU side of the same guest ring).
+ *
+ *   pop W0 u32 @0x00   push W1 u32 @0x04   modulus W3 = depth @0x0C
+ *   size @0x10         depth @0x14         buffer (u64 EA) @0x18
+ *
+ * Non-empty iff (W1 - W0) mod 2*W3 != 0, slot = W0 mod depth. The caller
+ * (PhysX's dispatcher pump) pops a two-word work item and inspects it, and
+ * ignores the return value, so when the ring is empty the out buffer has to be
+ * cleared: RPCS3's no-op stub leaves the caller's freshly zeroed stack in
+ * place, which reads as "no work", and reproducing that deterministically
+ * stops the pump from chasing a stale pointer. A blocking wait is never
+ * performed either -- with no SPU-side PhysX producer in this build it would
+ * spin the worker for good. */
+s32 _cellSpursLFQueuePopBody(u32 queue_ea, u32 buffer_ea, u32 isBlocking)
+{
+    extern uint8_t* vm_base;
+    (void)isBlocking;
+
+    if (!queue_ea || !buffer_ea || !vm_base) return (s32)0x80420101u;  /* CELL_SYNC_ERROR_INVAL */
+
+    const uint8_t* q = vm_base + queue_ea;
+    u32 W3     = ((u32)q[0x0C] << 24) | ((u32)q[0x0D] << 16) | ((u32)q[0x0E] << 8) | q[0x0F];
+    u32 size   = ((u32)q[0x10] << 24) | ((u32)q[0x11] << 16) | ((u32)q[0x12] << 8) | q[0x13];
+    u32 depth  = ((u32)q[0x14] << 24) | ((u32)q[0x15] << 16) | ((u32)q[0x16] << 8) | q[0x17];
+    u64 buffer = ((u64)q[0x18] << 56) | ((u64)q[0x19] << 48) | ((u64)q[0x1A] << 40) |
+                 ((u64)q[0x1B] << 32) | ((u64)q[0x1C] << 24) | ((u64)q[0x1D] << 16) |
+                 ((u64)q[0x1E] << 8)  |  (u64)q[0x1F];
+
+    if (!W3 || W3 != depth || !size || size > 0x10000u || depth > 0x1000u ||
+        !buffer || buffer > 0xFFFFFFFFull) {
+        { static int _n = 0; if (_n++ < 6)
+            printf("[lfq] BADHDR q=0x%08X W3=%u size=%u depth=%u buf=0x%llX\n",
+                   queue_ea, W3, size, depth, (unsigned long long)buffer); }
+        memset(vm_base + buffer_ea, 0, 8);           /* "nothing to pop" */
+        return (s32)0x80420104u;                    /* CELL_SYNC_ERROR_BUSY */
+    }
+
+    u32 W0 = ((u32)q[0x00] << 24) | ((u32)q[0x01] << 16) | ((u32)q[0x02] << 8) | q[0x03];
+    u32 W1 = ((u32)q[0x04] << 24) | ((u32)q[0x05] << 16) | ((u32)q[0x06] << 8) | q[0x07];
+    const u32 two   = 2u * W3;
+    u32 count = (W1 >= W0) ? (W1 - W0) : (W1 + two - W0);
+    count %= two;
+
+    if (count == 0) {
+        { static int _n = 0; if (_n++ < 6 || (_n % 200000) == 0)
+            printf("[lfq] EMPTY q=0x%08X W0=%u W1=%u depth=%u size=%u n=%d\n",
+                   queue_ea, W0, W1, depth, size, _n); }
+        memset(vm_base + buffer_ea, 0, 8);
+        return (s32)0x80420104u;                    /* empty */
+    }
+
+    { static int _n = 0; if (_n++ < 6)
+        printf("[lfq] POP q=0x%08X W0=%u W1=%u depth=%u size=%u slot0=%08X\n",
+               queue_ea, W0, W1, depth, size,
+               (unsigned)((((u32)vm_base[buffer + (W0 % depth) * size] << 24) |
+                           (vm_base[buffer + (W0 % depth) * size + 1] << 16) |
+                           (vm_base[buffer + (W0 % depth) * size + 2] << 8) |
+                            vm_base[buffer + (W0 % depth) * size + 3]))); }
+
+    u32 slot = W0 % depth;
+    u32 src  = (u32)buffer + slot * size;
+    memcpy(vm_base + buffer_ea, vm_base + src, size);
+    W0 = (W0 + 1) % two;
+    uint8_t* qv = vm_base + queue_ea;
+    qv[0x00] = (u8)(W0 >> 24); qv[0x01] = (u8)(W0 >> 16);
+    qv[0x02] = (u8)(W0 >> 8);  qv[0x03] = (u8)W0;
+    return CELL_OK;
 }
 
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)
@@ -3336,22 +3594,29 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     uint32_t q = (uint32_t)queue_ea;
     for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
 
-    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
-     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
-     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
-     * the queue look permanently empty no matter what a producer wrote. */
-    vm_write32(q + 0x0C, depth);
     vm_write32(q + 0x10, size);
     vm_write32(q + 0x14, depth);
-    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);   /* bcptr<void,u64> */
-    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
-     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
-     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
-     * write there marching through it one byte per dequeue --
-     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
-     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
-     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
-     * Whatever holds direction/init, it is not these offsets. */                          /* init: constructed */
+    /* The ANY2ANY ("3") queue tags the buffer pointer's bit 0 as its lock-free
+     * state flag; both sides mask it off before using the address. */
+    vm_write64(q + 0x18, (u64)((uint32_t)buffer_ea | (direction == 3u ? 1u : 0u)));
+    vm_write32(q + 0x24, direction);
+    /* +0x20 m_bs[4] / +0x28 m_v1 are the slot state machine. The two variants
+     * start it differently -- and 0 is NOT a valid empty state for ANY2ANY,
+     * which is what the SPU-side code (image 7 at LS 0x3EEC, GETLLAR of this
+     * line then ceqi +0x24,3) kept spinning on: with push2/pop2 left zero the
+     * packed 5-bit slot fields read as "no free slot" forever. */
+    if (direction == 3u) {
+        vm_write32(q + 0x20, 0xFFFF0000u);   /* m_bs[0]=m_bs[1]=-1, [2]=[3]=0 */
+        vm_write32(q + 0x28, 0xFFFFFFFFu);   /* m_v1 = -1 */
+        vm_write32(q + 0x30, 0x0000FFFFu);   /* push2 = { 0xffff } -- empty  */
+        vm_write32(q + 0x50, 0x0000FFFFu);   /* pop2  = { 0xffff }           */
+    } else {
+        vm_write32(q + 0x20, 0xFFFFFFFFu);   /* m_bs[0..3] = -1 */
+        vm_write32(q + 0x28, 0);             /* m_v1 = 0 */
+    }
+    /* init is *cleared* by the SDK when the construction completes
+     * (cellSyncLFQueueInitialize ends with queue->init.exchange(0)). */
+    vm_write32(q + 0x2C, 0);
     vm_write64(q + 0x70, (u64)(uint32_t)owner_ea);    /* eaSignal <- taskset/spurs */
 
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);

@@ -182,6 +182,19 @@ void spu_dbg_e60(spu_context* ctx)
  * service. Env YDKJ_STOP_NOHALT restores the old (looping) behavior for A/B. */
 void spu_stop(spu_context* ctx)
 {
+    /* sys_spu_thread_receive_event: for a thread running its own lifted
+     * sys_spu image, stop 0x110 means "hand me an event from the queue bound to
+     * the key in my out-mailbox". Service it here, blocking until one arrives,
+     * then leave the SPU RUNNING so the lifted helper continues inline (its next
+     * four rdch SPU_RdInMbox consume the reply staged in rcv_evt).
+     *
+     * This is NOT the SPURS case: a SPURS policy/task stops for its own
+     * reasons and must keep the yield-by-return semantics below. Only the raw
+     * thread path sets recv_evt_enabled (spu_lifted_thread_setup). */
+    if (ctx->stop_code == 0x110u && ctx->recv_evt_enabled) {
+        extern int spu_recv_event_service(spu_context*);
+        if (spu_recv_event_service(ctx)) { ctx->status = SPU_STATUS_RUNNING; return; }
+    }
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
      * policy this is stop-and-signal: it returns up into the kernel/policy
      * service loop, which continues (i.e. the SPU "resumes" past the stop). That
@@ -1742,6 +1755,10 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
                 (unsigned)bits, wobj); }
 }
 
+/* Debug-visible copy of the last task-API wait object (LS 0x2FDx arg, see
+ * spu_spurs_taskset_syscall). Only read by the SPU_DEBUG_POLL diagnostics. */
+uint32_t g_spu_wobj_debug;
+
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
@@ -1849,6 +1866,11 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
           } }
 
         if (ts) {
+            /* SPU_DEBUG_POLL consumers (spu_taskset_wait_signal) need the wait
+             * object EA the guest named in LS 0x2FDx -- usually the taskset's
+             * LFQueue-as-event-queue; a queue count changing proves a producer
+             * pushed work without going through the host HLE wake path. */
+            g_spu_wobj_debug = wobj;
             extern int spu_taskset_wait_signal(uint32_t, uint32_t);
             /* Park = OS-level wait on this SPU's host thread. Under the lockstep
              * gate the thread HOLDS the global run token here; parking without

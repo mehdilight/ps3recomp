@@ -368,6 +368,23 @@ s32 cellSysutilGetBgmPlaybackStatus(s32* status)
     return CELL_OK;
 }
 
+/* cellSysutilGetBgmPlaybackStatus2 (NID 0x6CFD856F) -- the revision-2 status
+ * struct is just the player state: CellSysutilBgmPlaybackStatus2 { u8
+ * playerState; char reserved[7]; } (8 bytes). LoS2's FMOD BGM status query
+ * thread pumps it every frame; the toolkit only had the v1 spelling, so the
+ * import fell through to the unresolved-NID handler. */
+s32 cellSysutilGetBgmPlaybackStatus2(void* status2)
+{
+    uint32_t out_ea = (uint32_t)(uintptr_t)status2;
+    if (!out_ea)
+        return CELL_SYSUTIL_ERROR_VALUE;
+
+    for (uint32_t o = 0; o < 8; o += 4)
+        vm_write32(out_ea + o, 0);
+    vm_write8(out_ea + 0x00, (uint8_t)s_bgm_status);   /* playerState */
+    return CELL_OK;
+}
+
 s32 cellSysutilSetBgmPlaybackExtraParam(void* param)
 {
     (void)param;

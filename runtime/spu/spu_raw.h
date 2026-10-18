@@ -77,6 +77,13 @@ int  spu_raw_reg_load(uint32_t ea, uint32_t* out);
 struct lv2_syscall_table;
 void sys_raw_spu_init(struct lv2_syscall_table* tbl);
 
+/* _sys_spu_image_import -> the image it resolved by fingerprint. Records the
+ * img_ea -> image id binding (see spu_raw.c) so a SPU THREAD started from that
+ * image gets the right one instead of an LS-address guess. Returns the image id
+ * the registry matched, or 0 when nothing matched. */
+int  spu_raw_note_image(uint32_t img_ea, uint32_t src_ea, uint32_t entry);
+int  spu_raw_image_id_for(uint32_t img_ea);
+
 #ifdef __cplusplus
 }
 #endif

@@ -201,6 +201,10 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+/* Revision-2 ("SPURS2") entry points. Same guest-visible instance/taskset
+ * layout as the first-version calls; separate NIDs, so separate symbols. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
@@ -231,9 +235,13 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr);
+s32 _cellSpursTasksetAttribute2Initialize(void* attribute, u32 revision);
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
+                            const void* attr);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);
+s32 cellSpursTasksetGetSpursAddress(CellSpursTaskset* taskset, u32* spurs);
 
 s32 cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr);
 s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
@@ -248,8 +256,16 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
                         u32 lsPattern_ea, u32 argument_ea);
+/* Revision-2 form: (taskset, &taskId, elf, &CellSpursTaskArgument,
+ * &CellSpursTaskAttribute2). The context/sizeContext/lsPattern live in the
+ * attribute instead of in separate arguments. */
+s32 _cellSpursTaskAttribute2Initialize(void* attribute, u32 revision);
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                         void* elf, void* argument, const void* attr);
 s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
                       s32* exitCode);
+s32 cellSpursJoinTask2(CellSpursTaskset* taskset, CellSpursTaskId taskId,
+                       s32* exitCode);
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
@@ -306,6 +322,7 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
+s32 _cellSpursLFQueuePopBody(u32 queue_ea, u32 buffer_ea, u32 isBlocking);
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,

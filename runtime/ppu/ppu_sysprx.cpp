@@ -206,6 +206,10 @@ static HANDLE lwm_sem(uint32_t addr)
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
  * logging during that window only (park hunts: gate on state, not counts). */
+/* Portable guest-callstack dump (sys_event.c): names the guest function a
+ * blocking thread is stuck in. */
+extern "C" void ps3_dbg_guest_bt(const char* tag);
+
 volatile int g_nd_inpump = 0;
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
@@ -239,6 +243,16 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
+            /* Name the guest function that is about to block -- an LWM convoy is
+             * otherwise invisible once the log goes quiet. Portable (the win32
+             * callstack helper is a no-op on macOS); first dozen only. */
+            { static long _bt = 0;
+              if (_bt++ < 12) {
+                  char tg[64];
+                  snprintf(tg, sizeof tg, "lwm wait tid=%llu lwm=0x%08X owner=%u",
+                           (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER));
+                  ps3_dbg_guest_bt(tg);
+              } }
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = WaitForSingleObject(s, ms);
@@ -619,7 +633,7 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t img_ea)
     return 0;
 }
 
-extern "C" void spu_raw_note_image(uint32_t src_ea, uint32_t entry);  /* runtime/spu/spu_raw.c */
+extern "C" int  spu_raw_note_image(uint32_t img_ea, uint32_t src_ea, uint32_t entry);  /* runtime/spu/spu_raw.c */
 
 static void hle_sys_spu_image_import(ppu_context* ctx)
 {
@@ -684,7 +698,7 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
      * is started by an MMIO store to its run-control register, with no syscall in
      * between, so this import is the last point at which the image can be matched
      * to a lifted entry (runtime/spu/spu_raw.c). No-op for a SPU-thread image. */
-    spu_raw_note_image(src_ea, entry);
+    spu_raw_note_image(img_ea, src_ea, entry);
     vm_write32(img_ea + 0x00, 0);                              /* type = USER */
     vm_write32(img_ea + 0x04, entry);
     vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);

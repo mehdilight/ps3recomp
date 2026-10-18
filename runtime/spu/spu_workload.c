@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -1073,6 +1074,137 @@ void spu_taskset_line_committed(uint32_t line)
     }
 }
 
+/* Wake every parked task whose wait object matches `wait_obj`, regardless of
+ * which taskset it owns. LoS2's Zlib data task parks on the SPURS
+ * LFQueue-as-port object; its PPU producer reaches us through the
+ * _cellSpursLFQueuePushBody import, which carries no taskset handle -- only
+ * the object EA the task itself published in WAIT_SIGNAL. */
+void spu_taskset_signal_parked_by_obj(uint32_t wait_obj)
+{
+    if (!wait_obj) return;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        const uint64_t k = s_parked[i];
+        if (!k) continue;
+        if (s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        if (!s_parked_obj[i]) continue;   /* unknown object: do not guess */
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+    }
+}
+
+/* _cellSpursLFQueuePushBody (NID 0x8A85674D) -- BLES01644 imports it.
+ *
+ * The title's file-worker queue is driven by recompiled guest code on BOTH
+ * ends: the producer calls this import (cellSpurs HLE), the consumer is the
+ * lifted SPURS task whose pop code runs the lock-free protocol directly over
+ * the 128-byte guest line. The guest layout is the one
+ * _cellSpursLFQueueInitialize (libs/spurs/cellSpurs.c) writes:
+ *
+ *   0x00 pop W0 u32      0x04 push W1 u32     0x0C modulus W3 = depth
+ *   0x10 size            0x14 depth           0x18 buffer (u64 EA)
+ *   0x70 eaSignal (owner EA)
+ *
+ * and the semantics are the ones the consumer's own decision block
+ * implements (derived in libs/spurs/cellSpurs.c cellSpursQueuePushBody,
+ * "phase 22"): non-empty when (W1-W0) mod 2*W3 != 0, slot = index mod W3.
+ * This is the SPURS-kernel ring scheme, NOT the cellSync MPMC scheme whose
+ * u16 fields share the same line -- the first attempt bumped +0x08 (cellSync
+ * completed-push) and the task spun on GETB reads forever. */
+int spu_spurs_lfqueue_push_body(uint32_t queue_ea, uint32_t data_ea, uint32_t isBlocking)
+{
+    extern uint8_t* vm_base;
+    static int s_v = -1;
+    if (s_v < 0) s_v = getenv("SPURS_PUSH_QUIET") ? 0 : 1;
+    if (!queue_ea || !data_ea || !vm_base) return (int)0x80420101u;
+
+    const uint8_t* q  = vm_base + queue_ea;
+    uint32_t W0 = ((uint32_t)q[0x00] << 24) | ((uint32_t)q[0x01] << 16) | ((uint32_t)q[0x02] << 8) | q[0x03];
+    uint32_t W1 = ((uint32_t)q[0x04] << 24) | ((uint32_t)q[0x05] << 16) | ((uint32_t)q[0x06] << 8) | q[0x07];
+    uint32_t W3 = ((uint32_t)q[0x0C] << 24) | ((uint32_t)q[0x0D] << 16) | ((uint32_t)q[0x0E] << 8) | q[0x0F];
+    uint32_t size  = ((uint32_t)q[0x10] << 24) | ((uint32_t)q[0x11] << 16) | ((uint32_t)q[0x12] << 8) | q[0x13];
+    uint32_t depth = ((uint32_t)q[0x14] << 24) | ((uint32_t)q[0x15] << 16) | ((uint32_t)q[0x16] << 8) | q[0x17];
+    uint64_t buffer = ((uint64_t)q[0x18] << 56) | ((uint64_t)q[0x19] << 48) | ((uint64_t)q[0x1A] << 40) |
+                      ((uint64_t)q[0x1B] << 32) | ((uint64_t)q[0x1C] << 24) | ((uint64_t)q[0x1D] << 16) |
+                      ((uint64_t)q[0x1E] << 8)  |  (uint64_t)q[0x1F];
+
+    if (!W3 || W3 != depth || !size || size > 0x10000u || depth > 0x1000u ||
+        !buffer || buffer > 0xFFFFFFFFull) {
+        static int once = 0;
+        if (s_v && !once) { once = 1;
+            fprintf(stderr, "[spu] PushBody(q=0x%08X data=0x%08X blocking=%u): "
+                            "queue header not sane (W3=%u size=%u depth=%u buf=0x%llX)\n",
+                    queue_ea, data_ea, isBlocking, W3, size, depth,
+                    (unsigned long long)buffer); fflush(stderr); }
+        return (int)0x80420101u;
+    }
+
+    /* Interior byte view for the store; W-side words are the same bytes. */
+    uint8_t* qv = vm_base + queue_ea;
+    const uint32_t two = 2u * W3;
+    int spins = 0;
+    for (;;) {
+        W0 = ((uint32_t)qv[0x00] << 24) | ((uint32_t)qv[0x01] << 16) | ((uint32_t)qv[0x02] << 8) | qv[0x03];
+        W1 = ((uint32_t)qv[0x04] << 24) | ((uint32_t)qv[0x05] << 16) | ((uint32_t)qv[0x06] << 8) | qv[0x07];
+        uint32_t count = (W1 >= W0) ? (W1 - W0) : (W1 + two - W0);
+        count %= two;
+        if (count < depth) {
+            /* Slot reservation. The consumer compares counters mod two, so a
+             * single BE store per side is what it expects from a producer
+             * that came in through the kernel port. */
+            uint32_t slot = W1 % depth;
+            uint32_t dst  = (uint32_t)buffer + slot * size;
+            if (dst - (uint32_t)buffer + size <= (1u << 28))     /* sanity */
+                memcpy(vm_base + dst, vm_base + data_ea, size);
+            W1 = (W1 + 1) % two;
+            qv[0x04] = (uint8_t)(W1 >> 24); qv[0x05] = (uint8_t)(W1 >> 16);
+            qv[0x06] = (uint8_t)(W1 >> 8);  qv[0x07] = (uint8_t)W1;
+            if (s_v) { static int _n = 0; if (_n++ < 16)
+                fprintf(stderr, "[spu] PushBody(q=0x%08X data=0x%08X blocking=%u) -> "
+                                "slot %u copied %u bytes, push W1=%u (pop W0=%u) -- waking parked\n",
+                        queue_ea, data_ea, isBlocking, slot, size, W1, W0); fflush(stderr); }
+            spu_taskset_signal_parked_by_obj(queue_ea);
+            return 0;
+        }
+        if (!isBlocking) return (int)0x80420104u;   /* CELL_SYNC_ERROR_BUSY-ish */
+        { if (++spins > 2000) spins = 0; usleep(500); }
+    }
+}
+static void spu_wait_signal_debug_poll(uint32_t taskset_ea)
+{
+    extern uint8_t* vm_base;   /* guest VM base (defined in the PPU core) */
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("SPU_DEBUG_POLL") ? 1 : 0;
+    if (!s_on || !taskset_ea || !vm_base) return;
+
+    extern uint32_t g_spu_wobj_debug;   /* spu_channels.c */
+    uint32_t wobj = g_spu_wobj_debug & ~0xFu;
+    const uint8_t* tsv = vm_base + taskset_ea;
+    fprintf(stderr, "[ws-poll] ts=0x%08X run=%02X%02X%02X%02X ready=%02X%02X%02X%02X "
+                    "pend=%02X%02X%02X%02X enab=%02X%02X%02X%02X sig=%02X%02X%02X%02X "
+                    "wait=%02X%02X%02X%02X",
+            taskset_ea,
+            tsv[0x00], tsv[0x01], tsv[0x02], tsv[0x03],
+            tsv[0x10], tsv[0x11], tsv[0x12], tsv[0x13],
+            tsv[0x20], tsv[0x21], tsv[0x22], tsv[0x23],
+            tsv[0x30], tsv[0x31], tsv[0x32], tsv[0x33],
+            tsv[0x40], tsv[0x41], tsv[0x42], tsv[0x43],
+            tsv[0x50], tsv[0x51], tsv[0x52], tsv[0x53]);
+    if (wobj) {
+        /* SPURS-kernel queue ring (see spu_spurs_lfqueue_push_body):
+         * pop W0 @0, push W1 @4, W2 @8, modulus W3 @0xC, size @0x10. */
+        const uint8_t* q = vm_base + wobj;
+        fprintf(stderr, " wobj=0x%08X q: pop=%u push=%u W2=%u W3=%u size=%u | ",
+                wobj,
+                (uint32_t)((q[0x00]<<24)|(q[0x01]<<16)|(q[0x02]<<8)|q[0x03]),
+                (uint32_t)((q[0x04]<<24)|(q[0x05]<<16)|(q[0x06]<<8)|q[0x07]),
+                (uint32_t)((q[0x08]<<24)|(q[0x09]<<16)|(q[0x0A]<<8)|q[0x0B]),
+                (uint32_t)((q[0x0C]<<24)|(q[0x0D]<<16)|(q[0x0E]<<8)|q[0x0F]),
+                (uint32_t)((q[0x10]<<24)|(q[0x11]<<16)|(q[0x12]<<8)|q[0x13]));
+        for (int i = 0; i < 0x20; i++) fprintf(stderr, "%02X%s", q[0x10 + i], i == 0x1F ? "" : " ");
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
  * until one is delivered. Returns 0 (the syscall's success rc). */
@@ -1132,6 +1264,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
+
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -1142,6 +1275,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
             if (drain && secs >= drain) { drained = 1; break; }
         }
+        spu_wait_signal_debug_poll(taskset_ea);
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
@@ -1156,6 +1290,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
             if (drain && secs >= drain) { drained = 1; break; }
         }
+        spu_wait_signal_debug_poll(taskset_ea);
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
