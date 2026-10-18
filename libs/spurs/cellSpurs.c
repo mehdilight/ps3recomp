@@ -3581,10 +3581,13 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
  * endian EA belongs. Hence a separate, guest-accurate initializer rather than
  * delegating to it.
  *
- * What is set here is only what the arguments determine outright: size, depth,
- * buffer, direction, and the init flag, over a zeroed line (the documented
- * empty state). The bs[]/v1 slot state machine is left zero -- see PROGRESS.md;
- * it is not guessed at. */
+ * The slot state machine is set to the documented EMPTY state of the variant
+ * asked for, because a zeroed line is not one: m_bs[0] = m_bs[1] = -1 and
+ * m_v1 = -1 with push2 = pop2 = 0xffff for ANY2ANY, m_bs[0..3] = -1 and
+ * m_v1 = 0 otherwise (RPCS3 cellSync.cpp syncLFQueueInitialize is the
+ * reference). With those left zero the SPU consumer's packed slot fields read
+ * "no free slot" for ever. init ends 0 -- the SDK sets it to 1 during
+ * construction and clears it at the end. */
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction)
 {
